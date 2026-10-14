@@ -1,11 +1,6 @@
 == instructions for the ESP32 v1 Dev board - pinouts may vary for other devices ==
 
-We're doing a basic README so the repo looks nicer - but this takes a NMEA stream from a UBlox GPS, tweaks the GPS to high speed serial, 
-turns on all the sentences, exposes a Bluetooth Serial device, and then outputs a sanitized 4800 baud stream to the Kenwood TM-D700a
-and probably others. Hook up your gps to the 3.3 or 5v rail, take its TTL level TX (NMEA out) to pin 16 (UART 2 RX) and put the TTL 
-level RX (NMEA in) to pin 17 (UART 2 TX), then hook the radio's tip pin to D4/GPIO4 and the shield (furthest back ring) to the GND 
-on the chip (there's more than one, so you don't necessarily have to bring everything back to a single pin), and you're in business.
+We're doing a basic README so the repo looks nicer - but this takes a NMEA stream from a UBlox GPS, tweaks the GPS to high speed serial, turns on all the sentences, exposes a Bluetooth Serial device, and then outputs a sanitized 4800 baud stream to the Kenwood TM-D700a and probably others. Hook up your gps to the 3.3 or 5v rail, take its TTL level TX (NMEA out) to pin 16 (UART 2 RX) and put the TTL  level RX (NMEA in) to pin 17 (UART 2 TX), then hook the radio's tip pin to D4/GPIO4 and the shield (furthest back ring) to the GND on the chip (there's more than one, so you don't necessarily have to bring everything back to a single pin), and you're in business.
 
-Pin mappings are defs in the top part of the code but they're chosen for Reasons (TM) so understand the chip and its functions 
-before screwing around with it.
+Pin mappings are defs in the top part of the code but they're chosen for Reasons (TM) so understand the chip and its functions before screwing around with it.
 
