@@ -2,16 +2,17 @@
   ESP32 GPS bridge for Kenwood TM-D700A
 
   On every boot:
-    - Finds the GPS baud rate automatically (4800, 9600, ...)
-    - Sets the GPS to output only GGA + RMC (in RAM, no flash wear)
-  Then, for every sentence:
-    - Drops anything with a bad checksum
-    - Renames $GN... to $GP... (fixes checksum) so any u-blox module works
-    - Passes only $GPRMC and $GPGGA on
-  Outputs:
-    - Radio: 4800 baud, RS-232 polarity (inverted)
-    - Bluetooth SPP: "D700-GPS"
-    - USB Serial Monitor: 115200
+    - Finds the GPS baud rate automatically
+    - Switches the GPS link to 38400 (RAM only) so all sentences fit
+    - Turns on all standard NMEA sentences (GGA, GLL, GSA, GSV, RMC, VTG)
+  For every sentence:
+    - Drops bad checksums, renames $GN -> $GP (fixing the checksum)
+    - Radio gets only $GPRMC + $GPGGA at 4800, RS-232 polarity
+    - Bluetooth "D700-GPS" gets everything
+    - USB Serial Monitor shows what goes to the radio
+  Power saving:
+    - Bluetooth turns off after 1 hour without moving more than 50 m
+    - Turns back on as soon as it moves
 
   Add new features in handleSentence() at the bottom.
 
@@ -27,6 +28,7 @@
 
 #define GPS_RX_PIN    16
 #define GPS_TX_PIN    17
+#define GPS_LINK_BAUD 38400
 
 #define RADIO_TX_PIN  4
 #define RADIO_RX_PIN  5      // unused, but must be a safe pin
@@ -34,12 +36,19 @@
 #define RADIO_INVERT  true   // true = RS-232 polarity
 
 #define BT_NAME       "D700-GPS"
+#define STATIONARY_MS (60UL * 60UL * 1000UL)   // 1 hour
+#define MOVE_METERS   50.0
 
 HardwareSerial gps(2);
 HardwareSerial radio(1);
 BluetoothSerial bt;
 
 String line;
+
+bool btOn = false;
+bool haveAnchor = false;
+double anchorLat = 0, anchorLon = 0;
+unsigned long lastMoveMs = 0;
 
 
 // ---------- u-blox helpers ----------
@@ -65,8 +74,22 @@ void setNmeaRate(uint8_t msgId, uint8_t rate) {
   sendUbx(0x06, 0x01, p, 3);
 }
 
+void setGpsBaud(uint32_t baud) {
+  uint8_t p[20] = {
+    0x01, 0x00, 0x00, 0x00,                       // UART1, reserved, txReady
+    0xD0, 0x08, 0x00, 0x00,                       // 8N1
+    (uint8_t)baud, (uint8_t)(baud >> 8), (uint8_t)(baud >> 16), (uint8_t)(baud >> 24),
+    0x03, 0x00, 0x03, 0x00,                       // in/out: UBX + NMEA
+    0x00, 0x00, 0x00, 0x00
+  };
+  sendUbx(0x06, 0x00, p, sizeof(p));
+  delay(150);
+  gps.updateBaudRate(baud);
+  delay(100);
+}
+
 long findGpsBaud() {
-  const long bauds[] = { 4800, 9600, 38400, 115200, 19200, 57600 };
+  const long bauds[] = { 38400, 4800, 9600, 115200, 19200, 57600 };
 
   for (long baud : bauds) {
     gps.updateBaudRate(baud);
@@ -78,10 +101,7 @@ long findGpsBaud() {
     while (millis() < until && seen.length() < 300) {
       if (gps.available()) seen += (char)gps.read();
     }
-    if (seen.indexOf("$GPRMC") >= 0 || seen.indexOf("$GNRMC") >= 0 ||
-        seen.indexOf("$GPGGA") >= 0 || seen.indexOf("$GNGGA") >= 0) {
-      return baud;
-    }
+    if (seen.indexOf("RMC,") >= 0 || seen.indexOf("GGA,") >= 0) return baud;
   }
   return 0;
 }
@@ -112,14 +132,75 @@ bool cleanSentence(String &s) {
   return true;
 }
 
+// Returns comma-separated field n (0 = "$GPRMC")
+String field(const String &s, int n) {
+  int start = 0;
+  for (int i = 0; i < n; i++) {
+    start = s.indexOf(',', start) + 1;
+    if (start == 0) return "";
+  }
+  int end = s.indexOf(',', start);
+  if (end < 0) end = s.indexOf('*', start);
+  return s.substring(start, end);
+}
+
+// "4230.62836","N" -> 42.5104...
+double toDegrees(const String &val, const String &hemi) {
+  double v = val.toDouble();
+  int deg = (int)(v / 100);
+  double d = deg + (v - deg * 100) / 60.0;
+  if (hemi == "S" || hemi == "W") d = -d;
+  return d;
+}
+
+double metersBetween(double lat1, double lon1, double lat2, double lon2) {
+  double dy = (lat2 - lat1) * 111320.0;
+  double dx = (lon2 - lon1) * 111320.0 * cos(lat1 * PI / 180.0);
+  return sqrt(dx * dx + dy * dy);
+}
+
+
+// ---------- Bluetooth on/off ----------
+
+void bluetoothOn() {
+  if (btOn) return;
+  bt.begin(BT_NAME);
+  btOn = true;
+  Serial.println("** Bluetooth ON");
+}
+
+void bluetoothOff() {
+  if (!btOn) return;
+  bt.end();
+  btOn = false;
+  Serial.println("** Bluetooth OFF (stationary 1 hour)");
+}
+
+// Called with every valid RMC. Tracks movement.
+void checkMovement(const String &rmc) {
+  if (field(rmc, 2) != "A") return;   // no fix, don't count as movement
+
+  double lat = toDegrees(field(rmc, 3), field(rmc, 4));
+  double lon = toDegrees(field(rmc, 5), field(rmc, 6));
+
+  if (!haveAnchor || metersBetween(anchorLat, anchorLon, lat, lon) > MOVE_METERS) {
+    anchorLat = lat;
+    anchorLon = lon;
+    haveAnchor = true;
+    lastMoveMs = millis();
+    bluetoothOn();
+  }
+}
+
 
 // ---------- setup / loop ----------
 
 void setup() {
   Serial.begin(115200);
+  gps.setRxBufferSize(2048);
   gps.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  radio.setTxBufferSize(1024);
   radio.begin(RADIO_BAUD, SERIAL_8N1, RADIO_RX_PIN, RADIO_TX_PIN, RADIO_INVERT);
-  bt.begin(BT_NAME);
   delay(1000);
 
   Serial.println("\nLooking for GPS...");
@@ -130,13 +211,21 @@ void setup() {
   }
   Serial.printf("  GPS found at %ld baud\n", baud);
 
-  setNmeaRate(0x00, 1);  // GGA on
-  setNmeaRate(0x04, 1);  // RMC on
-  setNmeaRate(0x01, 0);  // GLL off
-  setNmeaRate(0x02, 0);  // GSA off
-  setNmeaRate(0x03, 0);  // GSV off
-  setNmeaRate(0x05, 0);  // VTG off
-  Serial.println("  GPS set to GGA + RMC only");
+  if (baud != GPS_LINK_BAUD) {
+    setGpsBaud(GPS_LINK_BAUD);
+    Serial.printf("  GPS link switched to %d baud\n", GPS_LINK_BAUD);
+  }
+
+  setNmeaRate(0x00, 1);  // GGA
+  setNmeaRate(0x01, 1);  // GLL
+  setNmeaRate(0x02, 1);  // GSA
+  setNmeaRate(0x03, 1);  // GSV
+  setNmeaRate(0x04, 1);  // RMC
+  setNmeaRate(0x05, 1);  // VTG
+  Serial.println("  All standard sentences on");
+
+  bluetoothOn();
+  lastMoveMs = millis();
 
   Serial.printf("Radio: %d baud, invert=%s | Bluetooth: \"%s\"\n\n",
                 RADIO_BAUD, RADIO_INVERT ? "yes" : "no", BT_NAME);
@@ -155,13 +244,18 @@ void loop() {
       line += c;
     }
   }
+
+  if (btOn && millis() - lastMoveMs > STATIONARY_MS) bluetoothOff();
 }
 
 // Every valid, cleaned-up sentence lands here.
 void handleSentence(const String &s) {
+  if (btOn && bt.hasClient()) bt.print(s + "\r\n");
+
   if (s.startsWith("$GPRMC") || s.startsWith("$GPGGA")) {
     radio.print(s + "\r\n");
-    if (bt.hasClient()) bt.print(s + "\r\n");
     Serial.println("-> " + s);
   }
+
+  if (s.startsWith("$GPRMC")) checkMovement(s);
 }
